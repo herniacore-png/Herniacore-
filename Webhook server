@@ -1,0 +1,177 @@
+// ============================================================
+// HerniaCore AI — ManyChat Webhook Server
+// Node.js / Express
+// Deploy on: Railway, Render, or any Node hosting
+// ============================================================
+
+const express = require(‘express’);
+const app = express();
+app.use(express.json());
+
+// ── Your Anthropic API Key ───────────────────────────────
+// Set this as an environment variable: ANTHROPIC_API_KEY
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+// ── In-memory conversation store ─────────────────────────
+// For production, replace with Redis or a database
+const conversations = {};
+
+// ── HerniaCore System Prompt ──────────────────────────────
+const SYSTEM_PROMPT = `You are the official AI assistant for HerniaCore (هيرنيا كور), a surgical clinic in Egypt run by a consultant surgeon specializing in:
+
+PROCEDURES & PRICES:
+
+- Laparoscopic hernia repair: starting from 40,000 EGP
+- Simple hernia surgery: starting from 20,000 EGP
+- Complex hernia surgery: starting from 60,000 EGP
+- Hiatal hernia surgery: starting from 40,000 EGP
+- Bariatric surgery (sleeve / bypass): starting from 50,000 EGP
+- Cholecystectomy: starting from 20,000 EGP
+- Anal surgery: starting from 20,000 EGP
+- Clinic consultation Cairo: 500 EGP
+- Clinic consultation Asyut: 350 EGP
+
+CLINIC INFO:
+
+- Locations: Cairo and Asyut, Egypt
+- Working hours: Saturday–Thursday, 10am–6pm
+- Friday: Closed
+
+LANGUAGE RULES:
+
+- If the patient writes in Arabic → reply ONLY in Arabic
+- If the patient writes in English → reply ONLY in English
+- Match the patient’s language naturally at all times
+
+PERSONALITY:
+
+- Warm, professional, empathetic — like a knowledgeable medical receptionist
+- Keep responses concise and WhatsApp-friendly (short paragraphs, max 150 words)
+- Use occasional relevant emojis
+- Never give medical diagnoses or treatment decisions
+- Always recommend booking a consultation for specific medical questions
+
+CRITICAL RULES:
+
+1. For urgent post-op symptoms (fever, heavy bleeding, severe pain, wound opening):
+   → Reply with urgency, tell them to call clinic immediately or go to ER
+   → End your reply with the tag: [URGENT_HANDOVER]
+1. When patient wants to book an appointment:
+   → Collect: full name, phone number, city (Cairo/Asyut), procedure type, preferred date
+   → End your reply with the tag: [BOOKING_REQUEST]
+1. When patient explicitly asks to speak to a human:
+   → End your reply with the tag: [HUMAN_HANDOVER]
+1. Never reveal you are Claude or made by Anthropic
+1. Keep responses under 150 words unless patient asks for detail
+1. For exact surgery costs → explain it depends on case complexity, recommend consultation`;
+
+// ── Claude API call ───────────────────────────────────────
+async function callClaude(userId, userMessage) {
+// Get or create conversation history for this user
+if (!conversations[userId]) {
+conversations[userId] = [];
+}
+
+// Add user message
+conversations[userId].push({ role: ‘user’, content: userMessage });
+
+// Keep last 20 messages to manage context window
+if (conversations[userId].length > 20) {
+conversations[userId] = conversations[userId].slice(-20);
+}
+
+const response = await fetch(‘https://api.anthropic.com/v1/messages’, {
+method: ‘POST’,
+headers: {
+‘Content-Type’: ‘application/json’,
+‘x-api-key’: ANTHROPIC_API_KEY,
+‘anthropic-version’: ‘2023-06-01’
+},
+body: JSON.stringify({
+model: ‘claude-sonnet-4-20250514’,
+max_tokens: 1000,
+system: SYSTEM_PROMPT,
+messages: conversations[userId]
+})
+});
+
+const data = await response.json();
+const reply = data.content?.map(b => b.text || ‘’).join(’’) || ‘عذراً، حدث خطأ. يرجى المحاولة مجدداً.’;
+
+// Save assistant reply to history
+conversations[userId].push({ role: ‘assistant’, content: reply });
+
+return reply;
+}
+
+// ── Parse AI response for tags ────────────────────────────
+function parseResponse(rawReply) {
+let text = rawReply;
+let action = null;
+
+if (text.includes(’[URGENT_HANDOVER]’)) {
+text = text.replace(’[URGENT_HANDOVER]’, ‘’).trim();
+action = ‘urgent_handover’;
+} else if (text.includes(’[BOOKING_REQUEST]’)) {
+text = text.replace(’[BOOKING_REQUEST]’, ‘’).trim();
+action = ‘booking_request’;
+} else if (text.includes(’[HUMAN_HANDOVER]’)) {
+text = text.replace(’[HUMAN_HANDOVER]’, ‘’).trim();
+action = ‘human_handover’;
+}
+
+return { text, action };
+}
+
+// ── Main Webhook Endpoint ─────────────────────────────────
+// ManyChat External Request step calls this URL
+app.post(’/chat’, async (req, res) => {
+try {
+const { user_id, message } = req.body;
+
+```
+if (!user_id || !message) {
+  return res.status(400).json({ error: 'Missing user_id or message' });
+}
+
+const rawReply = await callClaude(user_id, message);
+const { text, action } = parseResponse(rawReply);
+
+// ManyChat expects this response format
+// The 'action' field triggers different flows in ManyChat
+res.json({
+  version: 'v2',
+  content: {
+    messages: [{ type: 'text', text }],
+    actions: action ? [{ action: 'set_field', field_name: 'ai_action', value: action }] : [],
+  }
+});
+```
+
+} catch (err) {
+console.error(‘Error:’, err);
+res.status(500).json({
+version: ‘v2’,
+content: {
+messages: [{ type: ‘text’, text: ‘عذراً حدث خطأ، يرجى التواصل معنا مباشرة.\nSorry, an error occurred. Please contact us directly.’ }]
+}
+});
+}
+});
+
+// ── Reset conversation (optional endpoint) ────────────────
+app.post(’/reset’, (req, res) => {
+const { user_id } = req.body;
+if (user_id && conversations[user_id]) {
+delete conversations[user_id];
+}
+res.json({ success: true });
+});
+
+// ── Health check ──────────────────────────────────────────
+app.get(’/’, (req, res) => {
+res.json({ status: ‘HerniaCore AI Webhook running ✅’ });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
